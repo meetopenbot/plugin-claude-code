@@ -109,18 +109,79 @@ const buildApiKeyWidget = (
     },
   });
 
-const extractTextFromAssistantMessage = (msg: SDKMessage): string | null => {
-  if (msg.type !== 'assistant') return null;
-  const content = msg.message?.content;
-  if (!Array.isArray(content)) return null;
-  const parts: string[] = [];
-  for (const block of content) {
-    if (block && typeof block === 'object' && (block as { type?: string }).type === 'text') {
-      const text = (block as { text?: unknown }).text;
-      if (typeof text === 'string' && text.length > 0) parts.push(text);
-    }
+const toolCallWidgetId = (toolUseId: string) => `claude_code_tool_${toolUseId}`;
+
+const truncate = (s: string, max: number) => (s.length > max ? `${s.slice(0, max)}\n…` : s);
+
+const formatJsonForWidget = (value: unknown, maxLen: number): string => {
+  try {
+    return truncate(JSON.stringify(value, null, 2), maxLen);
+  } catch {
+    return truncate(String(value), maxLen);
   }
-  return parts.length > 0 ? parts.join('\n') : null;
+};
+
+const formatToolResultPayload = (
+  content: unknown,
+  isError?: boolean,
+): { body: string; state?: 'error' } => {
+  let body: string;
+  if (typeof content === 'string') {
+    body = truncate(content, 12_000);
+  } else if (Array.isArray(content)) {
+    const textParts: string[] = [];
+    for (const block of content) {
+      if (block && typeof block === 'object' && (block as { type?: string }).type === 'text') {
+        const t = (block as { text?: unknown }).text;
+        if (typeof t === 'string' && t.length > 0) textParts.push(t);
+      }
+    }
+    body =
+      textParts.length > 0
+        ? truncate(textParts.join('\n'), 12_000)
+        : formatJsonForWidget(content, 12_000);
+  } else {
+    body = formatJsonForWidget(content, 12_000);
+  }
+  return isError ? { body, state: 'error' } : { body };
+};
+
+type ParsedToolUse = { toolUseId: string; title: string; input: unknown };
+
+const parseToolUseBlock = (block: unknown): ParsedToolUse | null => {
+  if (!block || typeof block !== 'object' || !('type' in block)) return null;
+  const type = (block as { type: string }).type;
+  if (type === 'tool_use') {
+    const b = block as { id?: unknown; name?: unknown; input?: unknown };
+    if (typeof b.id !== 'string' || typeof b.name !== 'string') return null;
+    return { toolUseId: b.id, title: b.name, input: b.input };
+  }
+  if (type === 'mcp_tool_use') {
+    const b = block as { id?: unknown; name?: unknown; server_name?: unknown; input?: unknown };
+    if (typeof b.id !== 'string' || typeof b.name !== 'string') return null;
+    const title =
+      typeof b.server_name === 'string' ? `${b.server_name}: ${b.name}` : b.name;
+    return { toolUseId: b.id, title, input: b.input };
+  }
+  if (type === 'server_tool_use') {
+    const b = block as { id?: unknown; name?: unknown; input?: unknown };
+    if (typeof b.id !== 'string' || typeof b.name !== 'string') return null;
+    return { toolUseId: b.id, title: b.name, input: b.input };
+  }
+  return null;
+};
+
+type ParsedToolResult = { toolUseId: string; content: unknown; isError?: boolean };
+
+const parseToolResultBlock = (block: unknown): ParsedToolResult | null => {
+  if (!block || typeof block !== 'object' || !('type' in block)) return null;
+  const type = (block as { type: string }).type;
+  if (type === 'tool_result' || type === 'mcp_tool_result') {
+    const b = block as { tool_use_id?: unknown; content?: unknown; is_error?: boolean };
+    if (typeof b.tool_use_id !== 'string') return null;
+    return { toolUseId: b.tool_use_id, content: b.content, isError: b.is_error };
+  }
+  return null;
 };
 
 /**
@@ -148,6 +209,7 @@ export const claudeCodeRuntime =
         if (!userContent) return;
 
         const threadId = event.meta?.threadId || context.state.threadId;
+
         const resumeId = readPersistedSessionId(context.state);
         const workingDir = cwd ?? context.state.channelDetails?.cwd;
 
@@ -163,6 +225,9 @@ export const claudeCodeRuntime =
         try {
           let lastSessionId: string | undefined = resumeId;
           let authWidgetYielded = false;
+          const emittedToolCallIds = new Set<string>();
+          const emittedToolResultIds = new Set<string>();
+          const toolTitleByUseId = new Map<string, { title: string; input: unknown }>();
 
           for await (const message of query({ prompt: userContent, options: sdkOptions })) {
             if ('session_id' in message && typeof message.session_id === 'string') {
@@ -180,13 +245,96 @@ export const claudeCodeRuntime =
               return;
             }
 
-            const text = extractTextFromAssistantMessage(message);
-            if (text) {
-              yield agentOutput({
-                agentId: context.state.agentId,
-                threadId,
-                content: text,
-              });
+            if (message.type === 'assistant') {
+              const content = message.message?.content;
+              if (Array.isArray(content)) {
+                const textParts: string[] = [];
+                for (const block of content) {
+                  const tool = parseToolUseBlock(block);
+                  if (tool) {
+                    if (textParts.length > 0) {
+                      const joined = textParts.join('\n');
+                      textParts.length = 0;
+                      if (joined.length > 0) {
+                        yield agentOutput({
+                          agentId: context.state.agentId,
+                          threadId,
+                          content: joined,
+                        });
+                      }
+                    }
+                    if (!emittedToolCallIds.has(tool.toolUseId)) {
+                      emittedToolCallIds.add(tool.toolUseId);
+                      toolTitleByUseId.set(tool.toolUseId, { title: tool.title, input: tool.input });
+                      yield uiWidget({
+                        agentId: context.state.agentId,
+                        threadId,
+                        widget: {
+                          kind: 'message',
+                          widgetId: toolCallWidgetId(tool.toolUseId),
+                          title: toolTitleByUseId.get(tool.toolUseId)?.title ?? '',
+                          description: JSON.stringify(toolTitleByUseId.get(tool.toolUseId)?.input ?? {}),
+                          body: formatJsonForWidget(tool.input, 8000),
+                          display: 'collapsed',
+                          metadata: {
+                            type: 'claude_tool',
+                            phase: 'call',
+                            toolName: tool.title,
+                            toolUseId: tool.toolUseId,
+                            source: 'claude-code',
+                          },
+                        },
+                      });
+                    }
+                    continue;
+                  }
+                  if (block && typeof block === 'object' && (block as { type?: string }).type === 'text') {
+                    const t = (block as { text?: unknown }).text;
+                    if (typeof t === 'string' && t.length > 0) textParts.push(t);
+                  }
+                }
+                if (textParts.length > 0) {
+                  const joined = textParts.join('\n');
+                  if (joined.length > 0) {
+                    yield agentOutput({
+                      agentId: context.state.agentId,
+                      threadId,
+                      content: joined,
+                    });
+                  }
+                }
+              }
+            }
+
+            if (message.type === 'user') {
+              const param = message.message;
+              if (param.role === 'user' && Array.isArray(param.content)) {
+                for (const block of param.content) {
+                  const res = parseToolResultBlock(block);
+                  if (!res || emittedToolResultIds.has(res.toolUseId)) continue;
+                  emittedToolResultIds.add(res.toolUseId);
+                  const { body, state } = formatToolResultPayload(res.content, res.isError);
+                  yield uiWidget({
+                    agentId: context.state.agentId,
+                    threadId,
+                    widget: {
+                      kind: 'message',
+                      widgetId: toolCallWidgetId(res.toolUseId),
+                      title: toolTitleByUseId.get(res.toolUseId)?.title ?? '',
+                      description: JSON.stringify(toolTitleByUseId.get(res.toolUseId)?.input ?? {}),
+                      body,
+                      display: "collapsed",
+                      ...(state ? { state } : {}),
+                      metadata: {
+                        type: 'claude_tool',
+                        phase: 'result',
+                        toolUseId: res.toolUseId,
+                        source: 'claude-code',
+                      },
+                    },
+                  });
+                }
+              }
             }
 
             if (message.type === 'result' && message.subtype !== 'success') {
