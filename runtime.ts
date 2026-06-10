@@ -1,3 +1,4 @@
+import { existsSync, readlinkSync, statSync } from 'node:fs';
 import { query, type Options, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import {
   agentOutput,
@@ -18,6 +19,8 @@ export interface ClaudeCodeRuntimeOptions {
   permissionMode?: NonNullable<Options['permissionMode']>;
   /** Working directory for the SDK subprocess (falls back to channel cwd). */
   cwd?: string;
+  /** Path to the Claude Code CLI executable (falls back to the SDK bundled binary). */
+  executablePath?: string;
   /** Restrict the SDK's built-in tools (Read, Edit, Bash, ...). */
   allowedTools?: string[];
   /** Storage handle for persisting the resume session id across runs. */
@@ -113,12 +116,192 @@ const toolCallWidgetId = (toolUseId: string) => `claude_code_tool_${toolUseId}`;
 
 const truncate = (s: string, max: number) => (s.length > max ? `${s.slice(0, max)}\n…` : s);
 
+const MAX_STDERR_CHARS = 4000;
+const MAX_ERROR_CHARS = 12_000;
+
+interface ClaudeLaunchContext {
+  executablePath?: string;
+  workingDir?: string;
+}
+
+interface SystemErrorLike {
+  code?: string;
+  errno?: number;
+  syscall?: string;
+  path?: string;
+}
+
+const asSystemError = (value: unknown): SystemErrorLike | undefined =>
+  value && typeof value === 'object' ? (value as SystemErrorLike) : undefined;
+
+const spawnFailureHint = (code: string | undefined, executablePath?: string): string | undefined => {
+  switch (code) {
+    case 'EACCES':
+      return executablePath
+        ? `Permission denied executing "${executablePath}". Check chmod +x and macOS quarantine (xattr -d com.apple.quarantine "${executablePath}").`
+        : 'Permission denied executing the Claude Code binary.';
+    case 'EPERM':
+      return 'Operation not permitted when launching Claude Code. Common under sandboxed runtimes or restricted security policies.';
+    case 'ENOENT':
+      return executablePath
+        ? `No such file at "${executablePath}", or a required runtime/interpreter is missing.`
+        : 'Claude Code executable or required runtime not found.';
+    case 'ENOTDIR':
+    case 'ELOOP':
+      return 'Invalid executable path — a path component is not a directory or is a symlink loop.';
+    default:
+      return undefined;
+  }
+};
+
+const describePathAccess = (label: string, path: string): string | undefined => {
+  try {
+    if (!existsSync(path)) return `${label}: missing (${path})`;
+    const st = statSync(path);
+    const lines = [
+      `${label}: ${path}`,
+      `exists: yes`,
+      `type: ${st.isDirectory() ? 'directory' : st.isFile() ? 'file' : 'other'}`,
+    ];
+    if (st.isFile()) {
+      lines.push(`size: ${st.size} bytes`);
+      lines.push(`mode: ${(st.mode & 0o777).toString(8)}`);
+      lines.push(`executable bit: ${(st.mode & 0o111) !== 0 ? 'yes' : 'no'}`);
+    }
+    try {
+      const target = readlinkSync(path);
+      lines.push(`symlink target: ${target}`);
+      lines.push(`target exists: ${existsSync(target) ? 'yes' : 'no'}`);
+    } catch {
+      // not a symlink
+    }
+    return lines.join('\n');
+  } catch (inspectError) {
+    return `${label}: could not inspect (${path}): ${
+      inspectError instanceof Error ? inspectError.message : String(inspectError)
+    }`;
+  }
+};
+
+const launchFailureHintsFromInspection = (
+  executableDetails: string | undefined,
+  workingDirDetails: string | undefined,
+  executablePath?: string,
+): string[] => {
+  const hints: string[] = [];
+  if (workingDirDetails?.includes('missing')) {
+    hints.push('Working directory does not exist. Create it or remove the cwd override from config.');
+  }
+  if (executableDetails?.includes('executable bit: no')) {
+    const hint = spawnFailureHint('EACCES', executablePath);
+    if (hint) hints.push(hint);
+  }
+  if (executableDetails?.includes('target exists: no')) {
+    hints.push('Executable symlink target is missing. Reinstall Claude Code or point executablePath at a valid binary.');
+  }
+  if (executableDetails?.includes('missing')) {
+    const hint = spawnFailureHint('ENOENT', executablePath);
+    if (hint) hints.push(hint);
+  }
+  if (hints.length === 0) {
+    hints.push(
+      'The Claude Code process could not be started. Verify executablePath, working directory permissions, and that OpenBot can spawn child processes in this environment.',
+    );
+  }
+  return hints;
+};
+
+const formatClaudeCodeError = (
+  error: unknown,
+  context: ClaudeLaunchContext,
+  stderrChunks: string[],
+): string => {
+  const err = error instanceof Error ? error : new Error(String(error));
+  const parts: string[] = [err.message];
+
+  const causeLines: string[] = [];
+  let current: unknown = err.cause;
+  while (current) {
+    if (current instanceof Error) {
+      causeLines.push(current.message);
+      const sys = asSystemError(current);
+      if (sys?.code) causeLines.push(`  code: ${sys.code}`);
+      if (sys?.errno !== undefined) causeLines.push(`  errno: ${sys.errno}`);
+      if (sys?.syscall) causeLines.push(`  syscall: ${sys.syscall}`);
+      if (sys?.path) causeLines.push(`  path: ${sys.path}`);
+      current = current.cause;
+    } else {
+      causeLines.push(String(current));
+      break;
+    }
+  }
+  if (causeLines.length > 0) parts.push(`Cause:\n${causeLines.join('\n')}`);
+
+  const sys = asSystemError(err.cause) ?? asSystemError(err);
+  const hint = spawnFailureHint(sys?.code, context.executablePath);
+  if (hint) parts.push(hint);
+
+  const isLaunchFailure =
+    err.message.includes('failed to launch') ||
+    err.message.includes('not found') ||
+    err.message.includes('Failed to spawn') ||
+    err.message.includes('exited with code') ||
+    err.message.includes('terminated by signal');
+
+  if (isLaunchFailure) {
+    const executableDetails = context.executablePath
+      ? describePathAccess('Executable', context.executablePath)
+      : 'Executable: using SDK bundled binary (no executablePath override).';
+    const workingDirDetails = context.workingDir
+      ? describePathAccess('Working directory', context.workingDir)
+      : undefined;
+    parts.push(`Launch diagnostics:\n${executableDetails}`);
+    if (workingDirDetails) parts.push(workingDirDetails);
+    if (err.message.includes('failed to launch')) {
+      for (const launchHint of launchFailureHintsFromInspection(
+        executableDetails,
+        workingDirDetails,
+        context.executablePath,
+      )) {
+        parts.push(launchHint);
+      }
+    }
+  }
+
+  const stderr = stderrChunks.join('').trim();
+  if (stderr) parts.push(`Process stderr:\n${truncate(stderr, MAX_STDERR_CHARS)}`);
+
+  return truncate(parts.join('\n\n'), MAX_ERROR_CHARS);
+};
+
+const formatResultError = (message: SDKMessage): string => {
+  if (message.type !== 'result' || message.subtype === 'success') return '';
+  const record = asRecord(message);
+  const parts: string[] = [`subtype: ${message.subtype}`];
+  const result = record.result;
+  if (typeof result === 'string' && result) parts.push(`result: ${result}`);
+  const errors = record.errors;
+  if (Array.isArray(errors) && errors.length > 0) {
+    parts.push(`errors:\n${errors.map((entry) => `- ${String(entry)}`).join('\n')}`);
+  }
+  return parts.join('\n');
+};
+
 const formatJsonForWidget = (value: unknown, maxLen: number): string => {
   try {
     return truncate(JSON.stringify(value, null, 2), maxLen);
   } catch {
     return truncate(String(value), maxLen);
   }
+};
+
+const formatToolInputBody = (input: unknown, maxLen = 8000): string =>
+  `Input:\n${formatJsonForWidget(input, maxLen)}`;
+
+const formatToolResultBody = (input: unknown, output: string): string => {
+  const inputSection = formatJsonForWidget(input, 4000);
+  const parts = [`Input:\n${inputSection}`, `Output:\n${output}`];
+  return parts.join('\n\n');
 };
 
 const formatToolResultPayload = (
@@ -195,6 +378,7 @@ export const claudeCodeRuntime =
         system,
         permissionMode = 'default',
         cwd,
+        executablePath,
         allowedTools,
         storage,
       } = options;
@@ -213,12 +397,21 @@ export const claudeCodeRuntime =
         const resumeId = readPersistedSessionId(context.state);
         const workingDir = cwd ?? context.state.channelDetails?.cwd;
 
+        const stderrChunks: string[] = [];
+        const launchContext: ClaudeLaunchContext = {
+          executablePath,
+          workingDir,
+        };
         const sdkOptions: Options = {
           model,
           permissionMode,
+          stderr: (data) => {
+            stderrChunks.push(data);
+          },
           ...(system ? { systemPrompt: { type: 'preset', preset: 'claude_code', append: system } } : {}),
           ...(resumeId ? { resume: resumeId } : {}),
           ...(workingDir ? { cwd: workingDir } : {}),
+          ...(executablePath ? { pathToClaudeCodeExecutable: executablePath } : {}),
           ...(allowedTools ? { allowedTools } : {}),
         };
 
@@ -273,8 +466,8 @@ export const claudeCodeRuntime =
                           kind: 'message',
                           widgetId: toolCallWidgetId(tool.toolUseId),
                           title: toolTitleByUseId.get(tool.toolUseId)?.title ?? '',
-                          description: JSON.stringify(toolTitleByUseId.get(tool.toolUseId)?.input ?? {}),
-                          body: formatJsonForWidget(tool.input, 8000),
+                          description: '',
+                          body: formatToolInputBody(tool.input),
                           display: 'collapsed',
                           metadata: {
                             type: 'claude_tool',
@@ -321,9 +514,12 @@ export const claudeCodeRuntime =
                       kind: 'message',
                       widgetId: toolCallWidgetId(res.toolUseId),
                       title: toolTitleByUseId.get(res.toolUseId)?.title ?? '',
-                      description: JSON.stringify(toolTitleByUseId.get(res.toolUseId)?.input ?? {}),
-                      body,
-                      display: "collapsed",
+                      description: '',
+                      body: formatToolResultBody(
+                        toolTitleByUseId.get(res.toolUseId)?.input,
+                        body,
+                      ),
+                      display: 'collapsed',
                       ...(state ? { state } : {}),
                       metadata: {
                         type: 'claude_tool',
@@ -348,10 +544,13 @@ export const claudeCodeRuntime =
                 yield buildApiKeyWidget(context.state.agentId, threadId, subtype);
                 return;
               }
+              const details = formatResultError(message);
               yield agentOutput({
                 agentId: context.state.agentId,
                 threadId,
-                content: `[claude-code] run ended with error: ${subtype}`,
+                content: details
+                  ? `[claude-code] run ended with error:\n${details}`
+                  : `[claude-code] run ended with error: ${subtype}`,
               });
             }
           }
@@ -360,7 +559,7 @@ export const claudeCodeRuntime =
             await persistSessionId(context.state, storage, lastSessionId);
           }
         } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
+          const errorMessage = formatClaudeCodeError(error, launchContext, stderrChunks);
           if (isAuthErrorMessage(errorMessage)) {
             yield buildApiKeyWidget(context.state.agentId, threadId, errorMessage);
             return;
@@ -368,7 +567,7 @@ export const claudeCodeRuntime =
           yield agentOutput({
             agentId: context.state.agentId,
             threadId,
-            content: `[claude-code] error: ${errorMessage}`,
+            content: `[claude-code] error:\n${errorMessage}`,
           });
         }
       });

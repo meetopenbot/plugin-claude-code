@@ -26,6 +26,11 @@ const claudeCodePlugin = {
         default: 'default',
         enum: ['default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk', 'auto'],
       },
+      executablePath: {
+        type: 'string' as const,
+        description:
+          'Path to the Claude Code CLI executable. When unset, the SDK uses its bundled binary.',
+      },
     },
   },
   factory: ({ agentDetails, config, storage }: PluginContext) => {
@@ -35,10 +40,15 @@ const claudeCodePlugin = {
         ? config.permissionMode
         : 'default'
     ) as NonNullable<Options['permissionMode']>;
+    const executablePath =
+      typeof config.executablePath === 'string' && config.executablePath
+        ? config.executablePath
+        : undefined;
 
     return claudeCodeRuntime({
       model,
       permissionMode,
+      executablePath,
       system: agentDetails.instructions || CLAUDE_CODE_SYSTEM_PROMPT,
       storage,
     });
