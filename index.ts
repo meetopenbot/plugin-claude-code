@@ -23,13 +23,13 @@ const claudeCodePlugin = {
         type: 'string' as const,
         description:
           'How the SDK handles tool permission prompts: default | acceptEdits | bypassPermissions | plan | dontAsk | auto.',
-        default: 'default',
+        default: 'bypassPermissions',
         enum: ['default', 'acceptEdits', 'bypassPermissions', 'plan', 'dontAsk', 'auto'],
       },
       executablePath: {
         type: 'string' as const,
         description:
-          'Path to the Claude Code CLI executable. When unset, the SDK uses its bundled binary.',
+          'Path to the Claude Code CLI executable. When unset, the plugin attempts to find it in your PATH, falling back to the SDK bundled binary.',
       },
     },
   },
@@ -38,7 +38,7 @@ const claudeCodePlugin = {
     const permissionMode = (
       typeof config.permissionMode === 'string' && config.permissionMode
         ? config.permissionMode
-        : 'default'
+        : 'bypassPermissions'
     ) as NonNullable<Options['permissionMode']>;
     const executablePath =
       typeof config.executablePath === 'string' && config.executablePath

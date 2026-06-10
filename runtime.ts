@@ -1,3 +1,4 @@
+import { execSync } from 'node:child_process';
 import { existsSync, readlinkSync, statSync } from 'node:fs';
 import { query, type Options, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import {
@@ -367,6 +368,19 @@ const parseToolResultBlock = (block: unknown): ParsedToolResult | null => {
   return null;
 };
 
+const findClaudeExecutable = (): string | undefined => {
+  try {
+    const command = process.platform === 'win32' ? 'where claude' : 'which claude';
+    const path = execSync(command, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    if (path && existsSync(path)) {
+      return path;
+    }
+  } catch {
+    // ignore errors (e.g. command not found)
+  }
+  return undefined;
+};
+
 /**
  * OpenBot plugin that drives an agent backed by `@anthropic-ai/claude-agent-sdk`.
  */
@@ -378,10 +392,12 @@ export const claudeCodeRuntime =
         system,
         permissionMode = 'default',
         cwd,
-        executablePath,
+        executablePath: executablePathOverride,
         allowedTools,
         storage,
       } = options;
+
+      const executablePath = executablePathOverride || findClaudeExecutable();
 
       builder.on('agent:invoke', async function* (event, context) {
         if (!shouldHandleInvoke(event as AgentInvokeEvent, context.state.agentId)) {
