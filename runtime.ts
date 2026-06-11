@@ -178,9 +178,8 @@ const describePathAccess = (label: string, path: string): string | undefined => 
     }
     return lines.join('\n');
   } catch (inspectError) {
-    return `${label}: could not inspect (${path}): ${
-      inspectError instanceof Error ? inspectError.message : String(inspectError)
-    }`;
+    return `${label}: could not inspect (${path}): ${inspectError instanceof Error ? inspectError.message : String(inspectError)
+      }`;
   }
 };
 
@@ -437,6 +436,12 @@ export const claudeCodeRuntime =
           const emittedToolCallIds = new Set<string>();
           const emittedToolResultIds = new Set<string>();
           const toolTitleByUseId = new Map<string, { title: string; input: unknown }>();
+
+          yield agentOutput({
+            agentId: context.state.agentId,
+            threadId,
+            content: 'Claude is starting...',
+          });
 
           for await (const message of query({ prompt: userContent, options: sdkOptions })) {
             if ('session_id' in message && typeof message.session_id === 'string') {
