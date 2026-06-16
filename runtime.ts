@@ -92,8 +92,8 @@ const buildApiKeyWidget = (
       title: 'Anthropic API Key Required',
       description:
         `Claude Code could not authenticate (${reason}). ` +
-        'Provide an Anthropic API key to continue. The key is stored as a ' +
-        'workspace variable on your machine and never leaves your local runtime.',
+        'Provide an Anthropic API key to continue. You can [get your API key from the Anthropic Console](https://console.anthropic.com/settings/keys). ' +
+        'The key is stored as a workspace variable on your machine and never leaves your local runtime.',
       fields: [
         {
           id: 'apiKey',
@@ -437,12 +437,6 @@ export const claudeCodeRuntime =
           const emittedToolResultIds = new Set<string>();
           const toolTitleByUseId = new Map<string, { title: string; input: unknown }>();
 
-          yield agentOutput({
-            agentId: context.state.agentId,
-            threadId,
-            content: 'Claude is starting...',
-          });
-
           for await (const message of query({ prompt: userContent, options: sdkOptions })) {
             if ('session_id' in message && typeof message.session_id === 'string') {
               lastSessionId = message.session_id;
@@ -456,6 +450,12 @@ export const claudeCodeRuntime =
             ) {
               authWidgetYielded = true;
               yield buildApiKeyWidget(context.state.agentId, threadId, message.error);
+
+              yield agentOutput({
+                agentId: context.state.agentId,
+                threadId,
+                content: 'Claude needs an API key to continue. Please provide ANTHROPIC_API_KEY as a variable from the workspace settings or inside the widget above.',
+              });
               return;
             }
 
@@ -487,9 +487,9 @@ export const claudeCodeRuntime =
                           kind: 'message',
                           widgetId: toolCallWidgetId(tool.toolUseId),
                           title: toolTitleByUseId.get(tool.toolUseId)?.title ?? '',
-                          description: '',
                           body: formatToolInputBody(tool.input),
                           display: 'collapsed',
+                          variant: 'basic',
                           metadata: {
                             type: 'claude_tool',
                             phase: 'call',
@@ -535,12 +535,12 @@ export const claudeCodeRuntime =
                       kind: 'message',
                       widgetId: toolCallWidgetId(res.toolUseId),
                       title: toolTitleByUseId.get(res.toolUseId)?.title ?? '',
-                      description: '',
                       body: formatToolResultBody(
                         toolTitleByUseId.get(res.toolUseId)?.input,
                         body,
                       ),
                       display: 'collapsed',
+                      variant: 'basic',
                       ...(state ? { state } : {}),
                       metadata: {
                         type: 'claude_tool',
@@ -621,8 +621,7 @@ export const claudeCodeRuntime =
               kind: 'message',
               title: 'API Key Saved',
               body: `Saved ${envVar} as a workspace variable. You can now continue the conversation.`,
-              state: 'submitted',
-              actions: [{ id: 'ok', label: 'Got it', variant: 'primary' }],
+              state: 'submitted'
             },
           });
 
