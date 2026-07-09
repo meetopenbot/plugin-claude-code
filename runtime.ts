@@ -489,7 +489,6 @@ export const claudeCodeRuntime =
                           title: toolTitleByUseId.get(tool.toolUseId)?.title ?? '',
                           body: formatToolInputBody(tool.input),
                           display: 'collapsed',
-                          variant: 'basic',
                           metadata: {
                             type: 'claude_tool',
                             phase: 'call',
@@ -540,7 +539,6 @@ export const claudeCodeRuntime =
                         body,
                       ),
                       display: 'collapsed',
-                      variant: 'basic',
                       ...(state ? { state } : {}),
                       metadata: {
                         type: 'claude_tool',
