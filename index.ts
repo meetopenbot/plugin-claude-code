@@ -1,10 +1,18 @@
-import { claudeCodeRuntime } from './runtime.js';
+import { defaultAuthMode, isCloudMode } from './cloud-mode.js';
+import { claudeCodeRuntime, type ClaudeAuthMode } from './runtime.js';
 import { CLAUDE_CODE_SYSTEM_PROMPT } from './system-prompt.js';
 import type { Options } from '@anthropic-ai/claude-agent-sdk';
 import {
   definePlugin,
   type PluginContext,
 } from '@meetopenbot/plugin-sdk';
+
+const resolveAuthMode = (config: Record<string, unknown>): ClaudeAuthMode => {
+  if (config.authMode === 'byok' || config.authMode === 'credits') {
+    return config.authMode;
+  }
+  return defaultAuthMode();
+};
 
 const claudeCodePlugin = {
   id: 'claude-code',
@@ -14,6 +22,17 @@ const claudeCodePlugin = {
   configSchema: {
     type: 'object' as const,
     properties: {
+      ...(isCloudMode()
+        ? {
+            authMode: {
+              type: 'string' as const,
+              description:
+                'Credits — use your workspace credit balance via OpenBot. BYOK — bring your own Anthropic API key.',
+              enum: ['credits', 'byok'],
+              default: 'credits',
+            },
+          }
+        : {}),
       model: {
         type: 'string' as const,
         description: 'Claude model alias or full id (e.g. sonnet, opus, claude-opus-4-5).',
@@ -49,6 +68,7 @@ const claudeCodePlugin = {
       model,
       permissionMode,
       executablePath,
+      authMode: resolveAuthMode(config),
       system: agentDetails.instructions || CLAUDE_CODE_SYSTEM_PROMPT,
       storage,
     });
