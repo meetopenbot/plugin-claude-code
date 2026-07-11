@@ -10,7 +10,10 @@ import {
   type PluginFactory,
   type Storage,
 } from '@meetopenbot/plugin-sdk';
-import { buildCreditsAnthropicEnv } from './credits-auth.js';
+import {
+  buildCreditsAnthropicEnv,
+  resolveCreditsAuthConfig,
+} from './credits-auth.js';
 import { defaultAuthMode, type ClaudeAuthMode } from './cloud-mode.js';
 
 export type { ClaudeAuthMode };
@@ -93,11 +96,37 @@ const isCreditsErrorMessage = (message: string): boolean => {
   );
 };
 
+const isIntegrationsProviderError = (message: string): boolean => {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes('provider api key not configured') ||
+    (lower.includes('503') && lower.includes('provider'))
+  );
+};
+
+const CREDITS_NOT_CONFIGURED_MESSAGE =
+  'OpenBot Credits is not configured on this runtime. The cloud host must set OPENBOT_INTEGRATIONS_BASE_URL and OPENBOT_INTEGRATIONS_TOKEN (try redeploying the workspace).';
+
+const CREDITS_PROVIDER_UNAVAILABLE_MESSAGE =
+  'OpenBot Credits could not reach Anthropic — the platform provider API key is not configured yet. Try again later or switch this agent to BYOK mode.';
+
+const CREDITS_AUTH_FAILED_MESSAGE =
+  'Claude could not authenticate via OpenBot Credits. Check your workspace credit balance in settings, or switch this agent to BYOK mode.';
+
 const buildSdkEnv = (authMode: ClaudeAuthMode): Options['env'] | undefined => {
   if (authMode !== 'credits') return undefined;
   const creditsEnv = buildCreditsAnthropicEnv();
   if (!creditsEnv) return undefined;
   return { ...process.env, ...creditsEnv };
+};
+
+const creditsErrorMessage = (message: string): string | undefined => {
+  if (isIntegrationsProviderError(message)) return CREDITS_PROVIDER_UNAVAILABLE_MESSAGE;
+  if (isCreditsErrorMessage(message)) {
+    return 'Insufficient workspace credits. Add credits in workspace settings or switch this agent to BYOK mode.';
+  }
+  if (isAuthErrorMessage(message)) return CREDITS_AUTH_FAILED_MESSAGE;
+  return undefined;
 };
 
 const buildApiKeyWidget = (
@@ -441,6 +470,15 @@ export const claudeCodeRuntime =
           workingDir,
         };
         const sdkEnv = buildSdkEnv(authMode);
+        if (authMode === 'credits' && !resolveCreditsAuthConfig()) {
+          yield agentOutput({
+            agentId: context.state.agentId,
+            threadId,
+            content: CREDITS_NOT_CONFIGURED_MESSAGE,
+          });
+          return;
+        }
+
         const sdkOptions: Options = {
           model,
           permissionMode,
@@ -455,12 +493,38 @@ export const claudeCodeRuntime =
           ...(sdkEnv ? { env: sdkEnv } : {}),
         };
 
+        let creditsFailureYielded = false;
+
         try {
           let lastSessionId: string | undefined = resumeId;
           let authWidgetYielded = false;
           const emittedToolCallIds = new Set<string>();
           const emittedToolResultIds = new Set<string>();
           const toolTitleByUseId = new Map<string, { title: string; input: unknown }>();
+
+          const emitAssistantText = function* (text: string) {
+            if (!text) return;
+
+            if (authMode === 'credits') {
+              const creditsMessage = creditsErrorMessage(text);
+              if (creditsMessage) {
+                if (creditsFailureYielded) return;
+                creditsFailureYielded = true;
+                yield agentOutput({
+                  agentId: context.state.agentId,
+                  threadId,
+                  content: creditsMessage,
+                });
+                return;
+              }
+            }
+
+            yield agentOutput({
+              agentId: context.state.agentId,
+              threadId,
+              content: text,
+            });
+          };
 
           for await (const message of query({ prompt: userContent, options: sdkOptions })) {
             if ('session_id' in message && typeof message.session_id === 'string') {
@@ -478,8 +542,7 @@ export const claudeCodeRuntime =
                 yield agentOutput({
                   agentId: context.state.agentId,
                   threadId,
-                  content:
-                    'Claude could not authenticate via OpenBot Credits. Check your workspace credit balance in settings, or switch this agent to BYOK mode.',
+                  content: creditsErrorMessage(message.error) ?? CREDITS_AUTH_FAILED_MESSAGE,
                 });
               } else {
                 yield buildApiKeyWidget(context.state.agentId, threadId, message.error);
@@ -504,11 +567,7 @@ export const claudeCodeRuntime =
                       const joined = textParts.join('\n');
                       textParts.length = 0;
                       if (joined.length > 0) {
-                        yield agentOutput({
-                          agentId: context.state.agentId,
-                          threadId,
-                          content: joined,
-                        });
+                        yield* emitAssistantText(joined);
                       }
                     }
                     if (!emittedToolCallIds.has(tool.toolUseId)) {
@@ -541,14 +600,7 @@ export const claudeCodeRuntime =
                   }
                 }
                 if (textParts.length > 0) {
-                  const joined = textParts.join('\n');
-                  if (joined.length > 0) {
-                    yield agentOutput({
-                      agentId: context.state.agentId,
-                      threadId,
-                      content: joined,
-                    });
-                  }
+                  yield* emitAssistantText(textParts.join('\n'));
                 }
               }
             }
@@ -592,27 +644,34 @@ export const claudeCodeRuntime =
                 'result' in message && typeof (message as { result?: unknown }).result === 'string'
                   ? (message as { result: string }).result
                   : '';
-              if (
-                authMode === 'credits' &&
-                (isCreditsErrorMessage(subtype) || isCreditsErrorMessage(resultText))
-              ) {
-                yield agentOutput({
-                  agentId: context.state.agentId,
-                  threadId,
-                  content:
-                    'Insufficient workspace credits. Add credits in workspace settings or switch this agent to BYOK mode.',
-                });
-                return;
+              const errorText = resultText || subtype;
+
+              if (authMode === 'credits') {
+                const creditsMessage = creditsErrorMessage(errorText);
+                if (creditsMessage) {
+                  if (!creditsFailureYielded) {
+                    creditsFailureYielded = true;
+                    yield agentOutput({
+                      agentId: context.state.agentId,
+                      threadId,
+                      content: creditsMessage,
+                    });
+                  }
+                  continue;
+                }
               }
+
               if (!authWidgetYielded && (isAuthErrorMessage(subtype) || isAuthErrorMessage(resultText))) {
                 authWidgetYielded = true;
                 if (authMode === 'credits') {
-                  yield agentOutput({
-                    agentId: context.state.agentId,
-                    threadId,
-                    content:
-                      'Claude could not authenticate via OpenBot Credits. Check your workspace credit balance in settings, or switch this agent to BYOK mode.',
-                  });
+                  if (!creditsFailureYielded) {
+                    creditsFailureYielded = true;
+                    yield agentOutput({
+                      agentId: context.state.agentId,
+                      threadId,
+                      content: creditsErrorMessage(errorText) ?? CREDITS_AUTH_FAILED_MESSAGE,
+                    });
+                  }
                 } else {
                   yield buildApiKeyWidget(context.state.agentId, threadId, subtype);
                 }
@@ -634,23 +693,29 @@ export const claudeCodeRuntime =
           }
         } catch (error) {
           const errorMessage = formatClaudeCodeError(error, launchContext, stderrChunks);
-          if (authMode === 'credits' && isCreditsErrorMessage(errorMessage)) {
-            yield agentOutput({
-              agentId: context.state.agentId,
-              threadId,
-              content:
-                'Insufficient workspace credits. Add credits in workspace settings or switch this agent to BYOK mode.',
-            });
-            return;
+          if (authMode === 'credits') {
+            const creditsMessage = creditsErrorMessage(errorMessage);
+            if (creditsMessage) {
+              if (!creditsFailureYielded) {
+                yield agentOutput({
+                  agentId: context.state.agentId,
+                  threadId,
+                  content: creditsMessage,
+                });
+              }
+              return;
+            }
           }
           if (isAuthErrorMessage(errorMessage)) {
             if (authMode === 'credits') {
-              yield agentOutput({
-                agentId: context.state.agentId,
-                threadId,
-                content:
-                  'Claude could not authenticate via OpenBot Credits. Check your workspace credit balance in settings, or switch this agent to BYOK mode.',
-              });
+              if (!creditsFailureYielded) {
+                creditsFailureYielded = true;
+                yield agentOutput({
+                  agentId: context.state.agentId,
+                  threadId,
+                  content: creditsErrorMessage(errorMessage) ?? CREDITS_AUTH_FAILED_MESSAGE,
+                });
+              }
             } else {
               yield buildApiKeyWidget(context.state.agentId, threadId, errorMessage);
             }
