@@ -1,4 +1,5 @@
 import { defaultAuthMode, isCloudMode } from './cloud-mode.js';
+import { resolveModelConfigField } from './model-registry.js';
 import { claudeCodeRuntime, type ClaudeAuthMode } from './runtime.js';
 import { CLAUDE_CODE_SYSTEM_PROMPT } from './system-prompt.js';
 import type { Options } from '@anthropic-ai/claude-agent-sdk';
@@ -13,6 +14,15 @@ const resolveAuthMode = (config: Record<string, unknown>): ClaudeAuthMode => {
   }
   return defaultAuthMode();
 };
+
+const resolveModel = (config: Record<string, unknown>): string => {
+  const raw = config.model;
+  if (typeof raw !== 'string' || !raw) return 'sonnet';
+  if (raw.startsWith('anthropic/')) return raw.slice('anthropic/'.length);
+  return raw;
+};
+
+const modelField = await resolveModelConfigField();
 
 const claudeCodePlugin = {
   id: 'claude-code',
@@ -33,11 +43,7 @@ const claudeCodePlugin = {
             },
           }
         : {}),
-      model: {
-        type: 'string' as const,
-        description: 'Claude model alias or full id (e.g. sonnet, opus, claude-opus-4-5).',
-        default: 'sonnet',
-      },
+      model: modelField,
       permissionMode: {
         type: 'string' as const,
         description:
@@ -53,7 +59,7 @@ const claudeCodePlugin = {
     },
   },
   factory: ({ agentDetails, config, storage }: PluginContext) => {
-    const model = typeof config.model === 'string' && config.model ? config.model : 'sonnet';
+    const model = resolveModel(config);
     const permissionMode = (
       typeof config.permissionMode === 'string' && config.permissionMode
         ? config.permissionMode
